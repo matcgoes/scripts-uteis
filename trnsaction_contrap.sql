@@ -568,3 +568,114 @@ enriched AS (
   FROM tx t
 )
 SELECT * FROM enriched;
+
+-- ***************
+
+-- =============================================================
+-- ADICIONANDO ATUALIZAÇÕES DE EXEMPLO
+-- =============================================================
+
+WITH tx AS (
+  SELECT
+    REGEXP_REPLACE(num_cpf_cnpj_emio, '[^0-9]', '') AS em_doc,
+    UPPER(cod_tipo_pess_emio)                        AS em_tp,
+    REGEXP_REPLACE(num_cpf_cnpj_favo, '[^0-9]', '') AS fv_doc,
+    UPPER(cod_tipo_pess_favo)                        AS fv_tp,
+    CAST(vlr_pix AS DOUBLE)                          AS vlr_pix
+  FROM base_transacoes
+  -- ${WHERE_CLAUSE_TX}
+),
+soc AS (
+  SELECT DISTINCT
+    REGEXP_REPLACE(num_cnpj_estb,     '[^0-9]', '') AS emp_doc,   -- PJ focal
+    UPPER(cod_tipo_pess)                            AS emp_tp,    -- tipicamente 'J'
+    REGEXP_REPLACE(num_cpf_cnpj_scio, '[^0-9]', '') AS soc_doc,   -- PF/PJ sócio
+    UPPER(cod_tipo_pess_scio)                       AS soc_tp
+  FROM base_quadro_soc
+  -- ${WHERE_CLAUSE_SOC}
+),
+
+-- pré-aggregates por participante (doc+tp)
+rec_ AS (
+  SELECT fv_doc AS doc, fv_tp AS tp,
+         SUM(vlr_pix) AS vlr_recebido, COUNT(*) AS qtd_recebida
+  FROM tx
+  GROUP BY fv_doc, fv_tp
+),
+pag_ AS (
+  SELECT em_doc AS doc, em_tp AS tp,
+         SUM(vlr_pix) AS vlr_pago, COUNT(*) AS qtd_paga
+  FROM tx
+  GROUP BY em_doc, em_tp
+),
+
+-- Nível 1: Global dos sócios reatribuído à empresa
+socio_global_por_empresa AS (
+  SELECT
+    s.emp_doc,
+    s.emp_tp,
+    COALESCE(SUM(r.vlr_recebido), 0) AS vlr_recm_totl_scio,
+    COALESCE(SUM(r.qtd_recebida), 0) AS qtd_recm_totl_scio,
+    COALESCE(SUM(p.vlr_pago),     0) AS vlr_pgto_totl_scio,
+    COALESCE(SUM(p.qtd_paga),     0) AS qtd_pgto_totl_scio
+  FROM soc s
+  LEFT JOIN rec_ r
+    ON r.doc = s.soc_doc AND r.tp = s.soc_tp
+  LEFT JOIN pag_ p
+    ON p.doc = s.soc_doc AND p.tp = s.soc_tp
+  GROUP BY s.emp_doc, s.emp_tp
+),
+
+-- pares de empresas com sócio em comum
+emp_emp_mesmo_socio AS (
+  SELECT DISTINCT
+    s1.emp_doc AS emp_a,   -- empresa focal
+    s2.emp_doc AS emp_b    -- outra empresa dos seus sócios
+  FROM soc s1
+  JOIN soc s2
+    ON s1.soc_doc = s2.soc_doc
+   AND s1.soc_tp  = s2.soc_tp
+   AND s1.emp_doc <> s2.emp_doc
+),
+
+-- Nível 2: Reatribuição do que OUTRAS empresas (emp_b) receberam/pagaram
+empresas_dos_socios_por_empresa AS (
+  SELECT
+    m.emp_a AS emp_doc,
+    COALESCE(SUM(r.vlr_recebido), 0) AS vlr_recm_totl_empr_asdo,
+    COALESCE(SUM(r.qtd_recebida), 0) AS qtd_recm_totl_empr_asdo,
+    COALESCE(SUM(p.vlr_pago),     0) AS vlr_pgto_empr_asdo,
+    COALESCE(SUM(p.qtd_paga),     0) AS qtd_pgto_empr_asdo
+  FROM emp_emp_mesmo_socio m
+  LEFT JOIN rec_ r ON r.doc = m.emp_b AND r.tp = 'J'   -- só empresas
+  LEFT JOIN pag_ p ON p.doc = m.emp_b AND p.tp = 'J'
+  GROUP BY m.emp_a
+)
+
+-- SAÍDA ÚNICA
+SELECT
+  COALESCE(p.doc, r.doc) AS doc,                -- pode ser PF ou PJ
+  COALESCE(p.tp,  r.tp)  AS tp,
+  COALESCE(p.vlr_pago,     0) AS vlr_pago,
+  COALESCE(p.qtd_paga,     0) AS qtd_paga,
+  COALESCE(r.vlr_recebido, 0) AS vlr_recebido,
+  COALESCE(r.qtd_recebida, 0) AS qtd_recebida,
+  COALESCE(nv1.vlr_recm_totl_scio, 0) AS vlr_recm_totl_scio,
+  COALESCE(nv1.qtd_recm_totl_scio, 0) AS qtd_recm_totl_scio,
+  COALESCE(nv1.vlr_pgto_totl_scio, 0) AS vlr_pgto_totl_scio,
+  COALESCE(nv1.qtd_pgto_totl_scio, 0) AS qtd_pgto_totl_scio,
+  COALESCE(nv2.vlr_recm_totl_empr_asdo, 0) AS vlr_recm_totl_empr_asdo,
+  COALESCE(nv2.qtd_recm_totl_empr_asdo, 0) AS qtd_recm_totl_empr_asdo,
+  COALESCE(nv2.vlr_pgto_empr_asdo,      0) AS vlr_pgto_empr_asdo,
+  COALESCE(nv2.qtd_pgto_empr_asdo,      0) AS qtd_pgto_empr_asdo
+FROM pag_ p
+FULL JOIN rec_ r
+  ON p.doc = r.doc AND p.tp = r.tp
+LEFT JOIN socio_global_por_empresa        nv1
+  ON COALESCE(p.doc, r.doc) = nv1.emp_doc
+ AND COALESCE(p.tp,  r.tp)  = nv1.emp_tp
+LEFT JOIN empresas_dos_socios_por_empresa nv2
+  ON COALESCE(p.doc, r.doc) = nv2.emp_doc
+-- opcional: se quiser restringir a saída final só a PJ, adicione WHERE tp='J'
+;
+
